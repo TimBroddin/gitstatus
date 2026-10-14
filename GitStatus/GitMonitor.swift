@@ -52,21 +52,78 @@ final class GitMonitor {
     }
 }
 
+private final class DataBox: @unchecked Sendable {
+    var data = Data()
+}
+
 // Fully nonisolated so git Process calls never touch the main actor
 nonisolated enum GitChecker {
+    struct GitResult {
+        var output: String
+        var errorOutput: String
+        var exitCode: Int32
+        var succeeded: Bool { exitCode == 0 }
+    }
+
+    /// Candidate git binaries. /usr/bin/git is only a shim that forwards to the Command Line Tools
+    /// or Xcode, and it stops working when those are missing or stale (typically after a macOS upgrade).
+    private static let gitCandidates = [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ]
+
+    /// First git binary that actually runs, cached after the first successful lookup.
+    private static let gitPathLock = NSLock()
+    nonisolated(unsafe) private static var cachedGitPath: String?
+
+    private static func resolveGitPath() -> (path: String?, failure: String?) {
+        gitPathLock.lock()
+        defer { gitPathLock.unlock() }
+        if let cachedGitPath { return (cachedGitPath, nil) }
+
+        var firstFailure: String?
+        for candidate in gitCandidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            let result = run(executable: candidate, arguments: ["--version"])
+            if let result, result.succeeded {
+                cachedGitPath = candidate
+                return (candidate, nil)
+            }
+            if firstFailure == nil {
+                let detail = result?.errorOutput.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                firstFailure = detail.isEmpty ? "\(candidate) failed to run" : detail
+            }
+        }
+        return (nil, firstFailure ?? "git not found. Install the Command Line Tools with: xcode-select --install")
+    }
+
     static func checkRepo(path: String, fetch: Bool) -> RepoStatus {
+        var fetchWarning: String?
         if fetch {
-            _ = runGit(in: path, args: ["fetch", "--quiet"])
+            let result = runGitResult(in: path, args: ["fetch", "--quiet"])
+            if !result.succeeded {
+                fetchWarning = "Fetch failed: " + firstLine(of: result.errorOutput)
+            }
         }
 
-        let porcelain = runGit(in: path, args: ["status", "--porcelain"])
-        let hasUncommitted = !(porcelain?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let porcelain = runGitResult(in: path, args: ["status", "--porcelain"])
+        guard porcelain.succeeded else {
+            // Never report "clean" when git did not actually answer.
+            return RepoStatus(
+                lastChecked: Date(),
+                error: "git failed: " + firstLine(of: porcelain.errorOutput),
+                fetchWarning: fetchWarning
+            )
+        }
+        let hasUncommitted = !porcelain.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-        let revList = runGit(in: path, args: ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        // Fails when the branch has no upstream, which is a legitimate "nothing to compare" case
+        // now that we know git itself works.
+        let revList = runGitResult(in: path, args: ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
         var ahead = 0
         var behind = 0
-        if let revList, !revList.isEmpty {
-            let parts = revList.trimmingCharacters(in: .whitespacesAndNewlines)
+        if revList.succeeded {
+            let parts = revList.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 .components(separatedBy: .whitespaces)
                 .filter { !$0.isEmpty }
             if parts.count >= 2 {
@@ -75,8 +132,10 @@ nonisolated enum GitChecker {
             }
         }
 
-        let branchOutput = runGit(in: path, args: ["symbolic-ref", "--short", "HEAD"])
-        let branch = branchOutput?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+        let branchResult = runGitResult(in: path, args: ["symbolic-ref", "--short", "HEAD"])
+        let branch = branchResult.succeeded
+            ? branchResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            : "unknown"
         let onDefault = (branch == "main" || branch == "master")
 
         let state: RepoState
@@ -90,24 +149,68 @@ nonisolated enum GitChecker {
             state = .clean
         }
 
-        return RepoStatus(state: state, onDefaultBranch: onDefault, currentBranch: branch, lastChecked: Date())
+        return RepoStatus(
+            state: state,
+            onDefaultBranch: onDefault,
+            currentBranch: branch,
+            lastChecked: Date(),
+            fetchWarning: fetchWarning
+        )
     }
 
+    private static func firstLine(of text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        return line.isEmpty ? "unknown error" : line
+    }
+
+    /// Runs git and returns its output, or nil if it failed (non-zero exit or could not be launched).
     static func runGit(in directory: String, args: [String]) -> String? {
+        let result = runGitResult(in: directory, args: args)
+        return result.succeeded ? result.output : nil
+    }
+
+    static func runGitResult(in directory: String, args: [String]) -> GitResult {
+        let resolved = resolveGitPath()
+        guard let gitPath = resolved.path else {
+            return GitResult(output: "", errorOutput: resolved.failure ?? "git not found", exitCode: -1)
+        }
+        return run(executable: gitPath, arguments: ["-C", directory] + args)
+            ?? GitResult(output: "", errorOutput: "could not launch \(gitPath)", exitCode: -1)
+    }
+
+    private static func run(executable: String, arguments: [String]) -> GitResult? {
         let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", directory] + args
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        // Never block on a credential or SSH prompt: fail instead of hanging the poll loop.
+        var env = ProcessInfo.processInfo.environment
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        process.environment = env
 
         do {
             try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
+        // Drain stderr concurrently so a chatty git cannot fill the pipe and deadlock.
+        let errBox = DataBox()
+        let errGroup = DispatchGroup()
+        errGroup.enter()
+        DispatchQueue.global().async {
+            errBox.data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            errGroup.leave()
+        }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        errGroup.wait()
+        return GitResult(
+            output: String(data: outData, encoding: .utf8) ?? "",
+            errorOutput: String(data: errBox.data, encoding: .utf8) ?? "",
+            exitCode: process.terminationStatus
+        )
     }
 }

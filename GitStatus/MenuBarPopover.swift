@@ -106,7 +106,7 @@ struct MenuBarPopover: View {
                             Button {
                                 store.openRepo(repo)
                             } label: {
-                                RepoRow(repo: repo, status: status, showDot: filter == .all)
+                                RepoRow(repo: repo, status: status, showDot: filter == .all, showDefaultBranchWarning: store.config.showDefaultBranchWarning)
                             }
                             .buttonStyle(.plain)
                             .contextMenu {
@@ -233,6 +233,7 @@ struct RepoRow: View {
     let repo: TrackedRepo
     let status: RepoStatus
     var showDot: Bool = true
+    var showDefaultBranchWarning: Bool = true
 
     var body: some View {
         HStack(spacing: 8) {
@@ -247,11 +248,17 @@ struct RepoRow: View {
                     Text(repo.displayName)
                         .font(.system(.body, weight: .medium))
                         .lineLimit(1)
-                    if status.onDefaultBranch {
+                    if showDefaultBranchWarning, status.onDefaultBranch {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .help("On default branch")
+                    }
+                    if let warning = status.fetchWarning {
+                        Image(systemName: "icloud.slash")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help(warning)
                     }
                 }
                 HStack(spacing: 4) {
@@ -259,7 +266,16 @@ struct RepoRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                    if showDot, status.state != .clean {
+                    if let error = status.error {
+                        Text("·")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                            .help(error)
+                    } else if showDot, status.state != .clean {
                         Text("·")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
@@ -278,11 +294,12 @@ struct RepoRow: View {
     }
 
     private var statusColor: Color {
+        if status.error != nil { return .gray }
         switch status.state {
-        case .clean: .green
-        case .uncommitted: .yellow
-        case .notPushed: .orange
-        case .behind: .red
+        case .clean: return .green
+        case .uncommitted: return .yellow
+        case .notPushed: return .orange
+        case .behind: return .red
         }
     }
 }

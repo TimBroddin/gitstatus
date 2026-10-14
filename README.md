@@ -23,7 +23,7 @@ A macOS menubar app that monitors the git status of your local repositories at a
 | Yellow | Uncommitted | Modified or untracked files |
 | Green | Clean | Everything in sync |
 
-An additional warning badge appears when you're working directly on `main` or `master`.
+An additional warning badge appears when you're working directly on `main` or `master` (can be turned off in Settings).
 
 ## Install
 

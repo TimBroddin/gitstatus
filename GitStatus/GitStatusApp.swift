@@ -93,6 +93,7 @@ struct GitStatusApp: App {
 
     init() {
         let s = RepoStore()
+        LoginItem.restoreIfNeeded(wanted: s.config.launchAtLogin)
         _store = State(initialValue: s)
         let m = GitMonitor(store: s)
         _monitor = State(initialValue: m)

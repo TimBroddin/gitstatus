@@ -20,7 +20,7 @@ final class RepoStore {
     var nonGreenCount: Int {
         enabledRepos.count { repo in
             guard let status = statuses[repo.path] else { return true }
-            return status.state != .clean
+            return status.state != .clean || status.error != nil
         }
     }
 
@@ -28,6 +28,9 @@ final class RepoStore {
         enabledRepos
             .map { repo in (repo, statuses[repo.path] ?? RepoStatus()) }
             .sorted { a, b in
+                if (a.1.error != nil) != (b.1.error != nil) {
+                    return a.1.error != nil
+                }
                 if a.1.state != b.1.state {
                     return a.1.state > b.1.state
                 }
